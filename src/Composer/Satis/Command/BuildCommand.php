@@ -52,6 +52,7 @@ class BuildCommand extends Command
                 new InputArgument('output-dir', InputArgument::OPTIONAL, 'Location where to output built files', null),
                 new InputOption('no-html-output', null, InputOption::VALUE_NONE, 'Turn off HTML view'),
                 new InputOption('skip-errors', null, InputOption::VALUE_NONE, 'Skip Download or Archive errors'),
+                new InputOption('auto-discover', null, InputOption::VALUE_NONE, 'Automatically discover and add new packages'),
             ))
             ->setHelp(<<<EOT
 The <info>build</info> command reads the given json file
@@ -102,8 +103,13 @@ EOT
         $verbose = $input->getOption('verbose');
         $configFile = $input->getArgument('file');
         $skipErrors = (bool)$input->getOption('skip-errors');
+        $autoDiscover = (bool)$input->getOption('auto-discover');
 
         if (preg_match('{^https?://}i', $configFile)) {
+            if($autoDiscover) {
+                throw new \InvalidArgumentException('The auto-discover option doesn\'t support remote config files like '.$configFile);
+            }
+
             $rfs = new RemoteFilesystem($this->getIO());
             $contents = $rfs->getContents(parse_url($configFile, PHP_URL_HOST), $configFile, false);
             $config = JsonFile::parseJson($contents, $configFile);
@@ -147,6 +153,10 @@ EOT
             $htmlView = !isset($config['output-html']) || $config['output-html'];
         }
 
+        if (!$htmlView && $autoDiscover) {
+            throw new \InvalidArgumentException('The remote-auto-discover option needs enabled html-output.');
+        }
+
         if (isset($config['archive']['directory'])) {
             $this->dumpDownloads($config, $packages, $input, $output, $outputDir, $skipErrors);
         }
@@ -158,7 +168,7 @@ EOT
         $includes = array(
             'include/all$'.$packageFileHash.'.json' => array( 'sha1'=>$packageFileHash ),
         );
-        
+
         $filename = $outputDir.'/packages.json';
         $this->dumpPackagesJson($includes, $output, $filename);
 
@@ -173,6 +183,9 @@ EOT
             $rootPackage = $composer->getPackage();
             $twigTemplate = isset($config['twig-template']) ? $config['twig-template'] : null;
             $this->dumpWeb($packages, $output, $rootPackage, $outputDir, $twigTemplate, $dependencies);
+            if($autoDiscover) {
+                $this->dumpAutoDiscover($output, $configFile, $outputDir);
+            }
         }
     }
 
@@ -366,7 +379,7 @@ EOT
         }
     }
 
-    
+
     private function dumpPackageIncludeJson(array $packages, OutputInterface $output, $filename)
     {
         $repo = array('packages' => array());
@@ -382,13 +395,13 @@ EOT
         $output->writeln("<info>wrote packages json $filenameWithHash</info>");
         return $filenameWithHash;
     }
-    
+
     private function dumpPackagesJson($includes, OutputInterface $output, $filename){
         $repo = array(
             'packages'          => array(),
             'includes'          => $includes,
         );
-        
+
         $output->writeln('<info>Writing packages.json</info>');
         $repoJson = new JsonFile($filename);
         $repoJson->write($repo);
@@ -423,6 +436,19 @@ EOT
         ));
 
         file_put_contents($directory.'/index.html', $content);
+    }
+
+    private function dumpAutoDiscover(OutputInterface $output, $config, $directory, $template = null)
+    {
+        $templateDir = $template ? pathinfo($template, PATHINFO_DIRNAME) : __DIR__.'/../../../../views';
+        $loader = new \Twig_Loader_Filesystem($templateDir);
+        $twig = new \Twig_Environment($loader);
+
+        $output->writeln('<info>Writing auto discover file</info>');
+        $content = $twig->render($template ? pathinfo($template, PATHINFO_BASENAME) : 'dumpPackages.php.twig', array(
+                'config'       => getcwd().'/'.$config
+            ));
+        file_put_contents($directory.'/dumpPackages.php', $content);
     }
 
     private function getMappedPackageList(array $packages)

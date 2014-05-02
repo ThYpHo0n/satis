@@ -54,8 +54,9 @@ class Application
 
     /**
      * ToDo: Implement error handling
-     * ToDo: Implement correct version handling (e.g. there exist an entry for this package in satis
+     * ToDo: Implement correct version handling (e.g. there exist an entry for this package in Satis
      *       but does not have the correct version)
+     * TBD: Implement automatic rebuild of Satis after saved the new Satis config
      */
     private function handleRequest()
     {
@@ -67,11 +68,17 @@ class Application
         $satisPackages = $this->selectPackages($satisComposer);
         $missingPackages = array_diff($remotePackages, $satisPackages);
 
-        foreach($missingPackages as $missingPackage) {
-            $this->config['require'][$missingPackage->getName()] = $missingPackage->getVersion();
+        if(sizeof($missingPackages)) {
+            foreach($missingPackages as $missingPackage) {
+                $this->config['require'][$missingPackage->getName()] = $missingPackage->getVersion();
+            }
+
+            file_put_contents($this->configPath, JsonFile::encode($this->config));
+            http_response_code(202);
+        } else {
+            http_response_code(200);
         }
 
-        file_put_contents($this->configPath, JsonFile::encode($this->config));
     }
 
     /**

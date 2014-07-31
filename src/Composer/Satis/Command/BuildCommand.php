@@ -12,6 +12,7 @@
 
 namespace Composer\Satis\Command;
 
+use Composer\Package\Loader\ArrayLoader;
 use Symfony\Component\Console\Input\InputInterface;
 use Symfony\Component\Console\Output\OutputInterface;
 use Symfony\Component\Console\Input\InputArgument;
@@ -50,6 +51,7 @@ class BuildCommand extends Command
             ->setDefinition(array(
                 new InputArgument('file', InputArgument::OPTIONAL, 'Json file to use', './satis.json'),
                 new InputArgument('output-dir', InputArgument::OPTIONAL, 'Location where to output built files', null),
+                new InputArgument('packages', InputArgument::IS_ARRAY | InputArgument::OPTIONAL, 'Packages that should be built, if not provided all packages are.', null),
                 new InputOption('no-html-output', null, InputOption::VALUE_NONE, 'Turn off HTML view'),
                 new InputOption('skip-errors', null, InputOption::VALUE_NONE, 'Skip Download or Archive errors'),
                 new InputOption('auto-discover', null, InputOption::VALUE_NONE, 'Automatically discover and add new packages'),
@@ -102,6 +104,7 @@ EOT
     {
         $verbose = $input->getOption('verbose');
         $configFile = $input->getArgument('file');
+        $packagesFilter = $input->getArgument('packages');
         $skipErrors = (bool)$input->getOption('skip-errors');
         $autoDiscover = (bool)$input->getOption('auto-discover');
 
@@ -147,7 +150,7 @@ EOT
         }
 
         $composer = $this->getApplication()->getComposer(true, $config);
-        $packages = $this->selectPackages($composer, $output, $verbose, $requireAll, $requireDependencies, $requireDevDependencies, $minimumStability, $skipErrors);
+        $packages = $this->selectPackages($composer, $output, $verbose, $requireAll, $requireDependencies, $requireDevDependencies, $minimumStability, $skipErrors, $packagesFilter);
 
         if ($htmlView = !$input->getOption('no-html-output')) {
             $htmlView = !isset($config['output-html']) || $config['output-html'];
@@ -162,6 +165,15 @@ EOT
         }
 
         $filenamePrefix = $outputDir.'/include/all';
+        $filename = $outputDir.'/packages.json';
+        if(!empty($packagesFilter)) {
+            // in case of an active package filter we need to load the dumped packages.json and merge the
+            // updated packages in
+            $oldPackages = $this->loadDumpedPackages($filename, $packagesFilter);
+            $packages += $oldPackages;
+            ksort($packages);
+        }
+
         $packageFile = $this->dumpPackageIncludeJson($packages, $output, $filenamePrefix);
         $packageFileHash = hash_file('sha1', $packageFile);
 
@@ -170,6 +182,7 @@ EOT
         );
 
         $filename = $outputDir.'/packages.json';
+
         $this->dumpPackagesJson($includes, $output, $filename);
 
         if ($htmlView) {
@@ -189,7 +202,7 @@ EOT
         }
     }
 
-    private function selectPackages(Composer $composer, OutputInterface $output, $verbose, $requireAll, $requireDependencies, $requireDevDependencies, $minimumStability, $skipErrors)
+    private function selectPackages(Composer $composer, OutputInterface $output, $verbose, $requireAll, $requireDependencies, $requireDevDependencies, $minimumStability, $skipErrors, array $packagesFilter = array())
     {
         $selected = array();
 
@@ -211,6 +224,7 @@ EOT
 
         if ($requireAll) {
             $links = array();
+            $filterForPackages = count($packagesFilter) > 0;
 
             foreach ($repos as $repo) {
                 // collect links for composer repos with providers
@@ -219,8 +233,18 @@ EOT
                         $links[] = new Link('__root__', $name, new MultiConstraint(array()), 'requires', '*');
                     }
                 } else {
-                    // process other repos directly
-                    foreach ($repo->getPackages() as $package) {
+                    $packages = array();
+                    if($filterForPackages) {
+                        // apply package filter if defined
+                        foreach ($packagesFilter as $filter) {
+                            $packages += $repo->findPackages($filter);
+                        }
+                    } else {
+                        // process other repos directly
+                        $packages = $repo->getPackages();
+                    }
+
+                    foreach ($packages as $package) {
                         // skip aliases
                         if ($package instanceof AliasPackage) {
                             continue;
@@ -242,6 +266,15 @@ EOT
             }
         } else {
             $links = array_values($composer->getPackage()->getRequires());
+
+            // only pick up packages in our filter, if a filter has been set.
+            if (count($packagesFilter) > 0) {
+                 $links = array_filter($links, function(Link $link) use ($packagesFilter) {
+                     return in_array($link->getTarget(), $packagesFilter);
+                });
+            }
+
+            $links = array_values($links);
         }
 
 
@@ -343,6 +376,9 @@ EOT
 
         /* @var \Composer\Package\CompletePackage $package */
         foreach ($packages as $name => $package) {
+            if ('metapackage' === $package->getType()) {
+                continue;
+            }
 
             if (true === $skipDev && true === $package->isDev()) {
                 $output->writeln(sprintf("<info>Skipping '%s' (is dev)</info>", $name));
@@ -363,10 +399,30 @@ EOT
             $output->writeln(sprintf("<info>Dumping '%s'.</info>", $name));
 
             try {
-                $path = $archiveManager->archive($package, $format, $directory);
+                if ('pear-library' === $package->getType()) {
+                    // PEAR packages are archives already
+                    $filesystem = new Filesystem();
+                    $packageName = $archiveManager->getPackageFilename($package);
+                    $path =
+                        realpath($directory) . '/' . $packageName . '.' .
+                        pathinfo($package->getDistUrl(), PATHINFO_EXTENSION);
+                    if (!file_exists($path)) {
+                        $downloadDir = sys_get_temp_dir() . '/composer_archiver/' . $packageName;
+                        $filesystem->ensureDirectoryExists($downloadDir);
+                        $downloadManager->download($package, $downloadDir, false);
+                        $filesystem->ensureDirectoryExists($directory);
+                        $filesystem->rename($downloadDir . '/' . pathinfo($package->getDistUrl(), PATHINFO_BASENAME), $path);
+                        $filesystem->removeDirectory($downloadDir);
+                    }
+                    // Set archive format to `file` to tell composer to download it as is
+                    $archiveFormat = 'file';
+                } else {
+                    $path = $archiveManager->archive($package, $format, $directory);
+                    $archiveFormat = $format;
+                }
                 $archive = basename($path);
                 $distUrl = sprintf('%s/%s/%s', $endpoint, $config['archive']['directory'], $archive);
-                $package->setDistType($format);
+                $package->setDistType($archiveFormat);
                 $package->setDistUrl($distUrl);
                 $package->setDistSha1Checksum(hash_file('sha1', $path));
                 $package->setDistReference($package->getSourceReference());
@@ -449,6 +505,45 @@ EOT
                 'config'       => getcwd().'/'.$config
             ));
         file_put_contents($directory.'/dumpPackages.php', $content);
+    }
+
+    private function loadDumpedPackages($filename, array $packagesFilter = array())
+    {
+        $packages = array();
+        $repoJson = new JsonFile($filename);
+        $dirName  = dirname($filename);
+
+        if ($repoJson->exists()) {
+            $loader       = new ArrayLoader();
+            $jsonIncludes = $repoJson->read();
+            $jsonIncludes = isset($jsonIncludes['includes']) && is_array($jsonIncludes['includes'])
+                ? $jsonIncludes['includes']
+                : array();
+
+            foreach ($jsonIncludes as $includeFile => $includeConfig) {
+                $includeJson = new JsonFile($dirName . '/' . $includeFile);
+                $jsonPackages = $includeJson->read();
+                $jsonPackages = isset($jsonPackages['packages']) && is_array($jsonPackages['packages'])
+                    ? $jsonPackages['packages']
+                    : array();
+
+                foreach ($jsonPackages as $jsonPackage) {
+                    if (is_array($jsonPackage)) {
+                        foreach ($jsonPackage as $jsonVersion) {
+                            if (is_array($jsonVersion)) {
+                                if(isset($jsonVersion['name']) && in_array($jsonVersion['name'], $packagesFilter)) {
+                                    continue;
+                                }
+                                $package = $loader->load($jsonVersion);
+                                $packages[$package->getUniqueName()] = $package;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        return $packages;
     }
 
     private function getMappedPackageList(array $packages)
